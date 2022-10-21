@@ -44,6 +44,21 @@ impl fmt::Display for Packet {
     }
 }
 
+#[derive(Eq, PartialEq, Hash)]
+struct PacketId(u8, u8, u8);
+
+impl From<(u8, u8, u8)> for PacketId {
+    fn from(v: (u8, u8, u8)) -> Self {
+        PacketId(v.0, v.1, v.2)
+    }
+}
+
+impl PartialEq<(u8, u8, u8)> for PacketId {
+    fn eq(&self, x:&(u8, u8, u8)) -> bool {
+        self.0 == x.0 && self.1 == x.1 && self.2 == x.2
+    }
+}
+
 /* Error types */
 pub struct UciPacketParseError {
     msg: String,
@@ -129,6 +144,7 @@ mod oid {
     pub const NXP_READ_CALIB_DATA       :u8 = 1;
 }
 
+#[allow(dead_code)]
 #[derive(PartialEq)]
 enum ParamType {
     Hex8,
@@ -140,6 +156,7 @@ enum ParamType {
     HexArray(i16),
     CharArray(u16),
     Table8(&'static [(u8, &'static str)]),
+    Map8(&'static HashMap<u8, &'static str>),
 }
 
 #[derive(PartialEq)]
@@ -154,6 +171,7 @@ impl Field {
             ParamType::HexArray(x) => x as usize,
             ParamType::CharArray(x) => x as usize,
             ParamType::Table8(_x) => 1,
+            ParamType::Map8(_x) => 1,
         }
     }
     fn length_compatible(&self, len: usize) -> bool {
@@ -241,7 +259,7 @@ lazy_static! {
             ( 0x01u8, Field("LOW_POWER_MODE", ParamType::Hex8) ),
         ])
     };
-    
+
     static ref DEVICE_CONF_PARAMS_NXP: HashMap<(u8, u8), Field> = {
         HashMap::from([
             ( (0xe4u8, 0x02u8), Field("DPD_WAKEUP_SRC", ParamType::Hex8) ),
@@ -319,7 +337,10 @@ lazy_static! {
             ( 0x33u8, Field("BLINK_RANDOM_INTERVAL", ParamType::Dec16) ),
             ( 0x34u8, Field("TDOA_REPORT_FREQUENCY", ParamType::Dec16) ),
             ( 0x35u8, Field("STS_LENGTH", ParamType::Dec8) ),
-        ]) }; static ref SESSION_STATE_CODES: HashMap<u8, &'static str> = { HashMap::from([
+        ])
+    };
+
+    static ref SESSION_STATE_CODES: HashMap<u8, &'static str> = { HashMap::from([
             ( 0x00u8, "SESSION_STATE_INIT" ),
             ( 0x01u8, "SESSION_STATE_DEINIT" ),
             ( 0x02u8, "SESSION_STATE_ACTIVE" ),
@@ -356,59 +377,31 @@ lazy_static! {
     };
 }
 
-macro_rules! lookup_string {
-    ($table: ident, $id: expr) => {
-        match $table.get($id) {
-            Some(x) => format!("{:#x}:{}", $id, x).to_string(),
-            None => format!("{:#x}:Unknown", $id).to_string(),
-        }
-    }
-}
-
-#[allow(unused_macros)]
-macro_rules! lookup_string_ext {
-    ($table: ident, $id0: expr, $id1: expr) => {
-        match $table.get(($id0, $id1)) {
-            Some(x) => format!("{:#4x}:{:#4x}:{}", $id0, $id1, x).to_string(),
-            None => format!("{:#x}:Unknown", $id).to_string(),
-        }
-    }
-}
-
 fn print_hexarr(pkt: &Packet, offset: usize, len: usize) -> String {
     (offset..offset + len).fold(String::from("{"), |arr, i| arr + format!(" {:#04x}", pkt.get(i)).as_str()) + " }"
+}
+
+trait Printer {
+    fn print_id<'a>(&self, name: &'a str);
+    fn print_param<'a>(&self, name: &'a str, val: &'a str);
+}
+
+struct BasicPrinter;
+
+impl Printer for BasicPrinter {
+    fn print_id<'a>(&self, name: &'a str) {
+        println!("{}", name);
+    }
+    fn print_param<'a>(&self, name: &'a str, val: &'a str) {
+        println!("- {} = {}", name, val);
+    }
 }
 
 /*
  * Packet Printers
  */
-struct PacketPrinter {
-    name: String,
-    handler: fn((u8, u8, u8), &'static PacketPrinter, Packet) -> Result<String, UciPacketParseError>,
-}
-
-fn print_packet_base(_type: (u8, u8, u8), printer: &'static PacketPrinter, _pkt: Packet) -> Result<String, UciPacketParseError> {
-    Ok(format!("{}", printer.name))
-}
-
-fn _print_packet_statusonly<'a>(name: &String, pkt: Packet, offset: usize, table: &HashMap<u8, &'static str>) -> Result<String, UciPacketParseError> {
-    match pkt.len() {
-        0 => Err(UciPacketParseError::new(format!("payload len mismatch, expected=1 actual={}", pkt.len()).as_str())),
-        _ => Ok(format!("{}: {}", name, lookup_string!(table, &pkt.get(offset))).to_string()),
-    }
-}
-
-fn print_packet_statusonly(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
-    _print_packet_statusonly(&printer.name, pkt, 0, &*STATUS_CODES)
-}
-
-fn print_packet_devicestatus(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
-    _print_packet_statusonly(&printer.name, pkt, 0, &*DEVICE_STATUS_CODES)
-}
-
-
 /* e.g. "DPD_WAKEUP_SRC = 0x0" */
-fn _print_field(field: &Field, pkt: &Packet, offset: usize, len: usize) -> String {
+fn print_field(field: &Field, pkt: &Packet, offset: usize, len: usize)-> String {
 
     macro_rules! printf {
         ($pkt: ident, $fmt: expr, $offset: expr, $len: ident) => {
@@ -423,7 +416,7 @@ fn _print_field(field: &Field, pkt: &Packet, offset: usize, len: usize) -> Strin
         }
     }
 
-    let value = if !field.length_compatible(len) {
+    if !field.length_compatible(len) {
         format!("length mismatch expected={}, actual={}", field.size(), len)
     } else {
         match field.1 {
@@ -447,185 +440,102 @@ fn _print_field(field: &Field, pkt: &Packet, offset: usize, len: usize) -> Strin
                     None => format!("{:#04x}(Unknown)", pkt.get(offset)),
                 }
             },
+            ParamType::Map8(t) => {
+                let id = pkt.get(offset);
+
+                match t.get(&id) {
+                    Some(x) => format!("{:#04x} ({})", id, x),
+                    None => format!("{:#04x}(Unknown)", id),
+                }
+            }
             _ => print_hexarr(pkt, offset, len),
         }
-    };
-    format!("{} = {}", field.0, value)
-}
-
-fn _print_config(pkt: Packet, off: usize,
-                table: &HashMap<u8, Field>,
-                ext_table: Option<&HashMap<(u8, u8), Field>>) -> Result<String, UciPacketParseError> {
-
-    if pkt.len() < 5 {
-        return Err(UciPacketParseError::new("payload len is zero"));
     }
-
-    let num:u8 = pkt.get(off);
-    let mut s = format!("{} parameters:", num);
-    let mut n = 0;
-    let mut offset: usize = off + 1;
-
-    while n < num {
-        if (offset + 2) > pkt.len().into() {
-            s = s + "\n - Error marker";
-            break;
-        }
-
-        let id0 = pkt.get(offset);
-        let len: usize;
-
-        /* field id */
-        let field = if id0 < 0xe0u8 || (offset + 3) > pkt.len().into() || ext_table == None {
-            /* standard TLV */
-            len = pkt.get(offset + 1).into();
-            s = s + &format!("\n - {:#04x} ", id0);
-            offset = offset + 2;
-            table.get(&id0)
-        } else {
-            /* NXP extended TLV: id0 + id1 + len + value */
-            let id1 = pkt.get(offset + 1);
-            len = pkt.get(offset + 2).into();
-            s = s + &format!("\n - {:#04x}:{:#04x} ", id0, id1);
-            offset = offset + 3;
-            ext_table.unwrap().get(&(id0, id1))
-        };
-
-        /* field name = value */
-        let param_tail = match field {
-            Some(f) => _print_field(f, &pkt, offset, len),
-            None => format!("Unknown = {}", print_hexarr(&pkt, offset, len))
-        };
-        s.push_str(&param_tail);
-
-        offset = offset + len;
-        n = n + 1;
-    }
-    Ok(s)
 }
 
-fn print_set_config(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
-    let mut s = format!("{} ", printer.name);
-    let ret = match _print_config(pkt, 0, &*DEVICE_CONF_PARAMS, Some(&*DEVICE_CONF_PARAMS_NXP)) {
-        Ok(x) => x,
-        Err(e) => return Err(e),
-    };
-    s.push_str(&ret);
-    Ok(s)
-}
-
-fn print_set_appconfig(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
-    if pkt.len() < 4 {
-        return Err(UciPacketParseError::new("Can't get session id"));
-    }
-
-    let mut s = format!("{} ", printer.name);
-    s = s + &format!("SessionID = {:#010x}, ", LittleEndian::read_u16(&pkt.slice(0, 4)));
-
-    let ret = match _print_config(pkt, 4, &*APP_CONF_PARAMS, None) {
-        Ok(x) => x,
-        Err(e) => return Err(e),
-    };
-    s.push_str(&ret);
-    Ok(s)
-}
-
-fn _print_static<'a>(name: &'a str, pkt: Packet, fields: &[Field])-> Result<String, UciPacketParseError> {
+fn print_static<'a>(printer: &dyn Printer, pkt: &Packet, fields: &[Field])-> Result<(), UciPacketParseError> {
     let mut offset = 0;
-    let mut s = String::from(name);
 
     for field in fields {
         let len = field.size();
         if (offset + len) > pkt.len().into() {
             return Err(UciPacketParseError::new("length mismatch"));
         }
-        let x = _print_field(field, &pkt, offset, len);
-        s = s + " ";
-        s.push_str(&x);
+        let v = print_field(field, &pkt, offset, len);
+        printer.print_param(field.0, &v);
         offset = offset + len;
     }
-    Ok(s)
+    Ok(())
 }
 
-fn print_session_init_cmd(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
-    let field_arr = [
-          Field("SESSION_ID", ParamType::Hex32),
-          Field("SESSION_TYPE", ParamType::Hex8),
-    ];
-    _print_static(&printer.name, pkt, &field_arr)
+fn print_status_only(printer: &impl Printer, pkt: &Packet) -> Result<(), UciPacketParseError> {
+    print_static(printer, pkt, &[Field("STATUS", ParamType::Map8(&*STATUS_CODES))])
 }
 
-fn print_session_init_ntf(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
-    if pkt.len() < 6 {
-        return Err(UciPacketParseError::new("payload len mismatch"));
+fn print_config(printer: &dyn Printer, pkt: &Packet, off: usize,
+                table: &HashMap<u8, Field>,
+                ext_table: Option<&HashMap<(u8, u8), Field>>) -> Result<(), UciPacketParseError> {
+
+    if pkt.len() < 5 {
+        return Err(UciPacketParseError::new("payload len is zero"));
     }
 
-    let session_id = _print_field(&Field("SESSION_ID", ParamType::Hex32), &pkt, 0, 4);
-    let state = format!("SESSION_STATE = {}", lookup_string!(SESSION_STATE_CODES, &pkt.get(4)));
-    let reason = _print_field(&Field("REASON_CODE", ParamType::Hex8), &pkt, 5, 1);
+    let num:u8 = pkt.get(off);
+    let mut n = 0;
+    let mut offset: usize = off + 1;
 
-    Ok(format!("{}\n - {}\n - {}\n - {}", printer.name, session_id, state, reason))
+    printer.print_param("Number of parameters", &format!("{}", num));
+
+    while n < num {
+        if (offset + 2) > pkt.len().into() {
+            printer.print_param("RESIDUE", "parse error");
+            break;
+        }
+
+        let b0 = pkt.get(offset);
+        let b1 = pkt.get(offset + 1);
+        let len: usize;
+
+        let (name, val) = if b0 < 0xe0u8 || (offset + 3) > pkt.len().into() || ext_table == None {
+            /* standard TLV */
+            len = b1.into();
+            offset = offset + 2;
+            match table.get(&b0) {
+                Some(field) => (format!("{}({:#04x})", field.0, b0), print_field(field, &pkt, offset, len)),
+                None => (format!("Unknown({:#04x})", b0), print_hexarr(&pkt, offset, len)),
+            }
+        } else {
+            /* NXP extended TLV: id0 + id1 + len + value */
+            len = pkt.get(offset + 2).into();
+            offset = offset + 3;
+            match ext_table.unwrap().get(&(b0, b1)) {
+                Some(field) => (format!("{}({:#04x}:{:#04x})", field.0, b0, b1), print_field(field, &pkt, offset, len)),
+                None => (format!("Unknown({:#04x} {:#04x})", b0, b1), print_hexarr(&pkt, offset, len)),
+            }
+        };
+
+        printer.print_param(name.as_str(), val.as_str());
+
+        offset = offset + len;
+        n = n + 1;
+    }
+    Ok(())
 }
 
-fn print_core_device_init_cmd(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
-    let field_arr = [
-          Field("Major Version", ParamType::Hex8),
-          Field("Minor Version", ParamType::Hex8),
-    ];
-    _print_static(&printer.name, pkt, &field_arr)
-}
-
-fn print_set_calibration(_type: (u8, u8, u8), printer: &'static PacketPrinter, pkt: Packet) -> Result<String, UciPacketParseError> {
+fn print_set_calibration(printer: &dyn Printer, pkt: &Packet) -> Result<(), UciPacketParseError> {
 
     if pkt.len() < 3 {
         return Err(UciPacketParseError::new("payload len mismatch"));
     }
-  
-    let ch = pkt.get(0);
+
+    printer.print_param("CHANNEL", &format!("{}", pkt.get(0)));
     let id = pkt.get(1);
-    let param = match DEVCAL_PARAMS_NXP.get(&id) {
-        Some(field) => _print_field(field, &pkt, 2, (pkt.len() - 2).into()),
-        None => format!("{:#4x}:Unknown = {}", id, print_hexarr(&pkt, 2, (pkt.len() - 2).into())),
+    let (name, val) = match DEVCAL_PARAMS_NXP.get(&id) {
+        Some(field) => (format!("{}({:#04x})", field.0, id), print_field(field, &pkt, 2, (pkt.len() - 2).into())),
+        None => (format!("{:#4x}:Unknown", id), print_hexarr(&pkt, 2, (pkt.len() - 2).into())),
     };
-
-    Ok(format!("{} Channel={} {}", printer.name, ch, param))
-}
-
-lazy_static! {
-    static ref PRINTERS: HashMap<(u8, u8, u8), PacketPrinter> = {
-
-        macro_rules! insert_printer{
-            ($h: ident, $gid: ident, $oid: ident, $mt: ident, $func: ident) => {
-                $h.insert((gid::$gid, oid::$oid, mt::$mt),
-                    PacketPrinter {
-                        name: concat!(stringify!($oid), "_", stringify!($mt)).to_string(),
-                        handler: $func,
-                    });
-            }
-        }
-        let mut table = HashMap::new();
-
-        insert_printer!(table, CORE, CORE_DEVICE_RESET, CMD, print_packet_base);
-        insert_printer!(table, CORE, CORE_DEVICE_RESET, RSP, print_packet_statusonly);
-        insert_printer!(table, CORE, CORE_DEVICE_STATUS, NTF, print_packet_devicestatus);
-        insert_printer!(table, CORE, CORE_GET_DEVICE_INFO, CMD, print_packet_base);
-        insert_printer!(table, CORE, CORE_SET_CONFIG, CMD, print_set_config);
-        insert_printer!(table, CORE, CORE_SET_CONFIG, RSP, print_packet_statusonly);    /* skip other fields */
-
-        insert_printer!(table, SESSION, SESSION_INIT, CMD, print_session_init_cmd);
-        insert_printer!(table, SESSION, SESSION_INIT, RSP, print_packet_statusonly);
-        insert_printer!(table, SESSION, SESSION_STATUS, NTF, print_session_init_ntf);
-
-        insert_printer!(table, SESSION, SESSION_SET_APP_CONFIG, CMD, print_set_appconfig);
-        insert_printer!(table, SESSION, SESSION_SET_APP_CONFIG, RSP, print_packet_statusonly); /* skip other fields */
-
-        insert_printer!(table, PROPRIETARY, NXP_CORE_DEVICE_INIT, CMD, print_core_device_init_cmd);
-        insert_printer!(table, PROPRIETARY, NXP_CORE_DEVICE_INIT, RSP, print_packet_statusonly);
-
-        insert_printer!(table, PROPRIETARY, NXP_SET_CALIBRATION, CMD, print_set_calibration);
-        insert_printer!(table, PROPRIETARY, NXP_SET_CALIBRATION, RSP, print_packet_statusonly);
-        table
-    };
+    printer.print_param(&name, &val);
+    Ok(())
 }
 
 
@@ -642,7 +552,7 @@ fn to_packet(s: String) -> Result<Packet, UciPacketParseError> {
         Ok(bytes) => bytes,
         Err(_e) => return Err(UciPacketParseError::new("Failed to parse hex string"))
     };
-  
+
     if bytes.len() < 4 {
         return Err(UciPacketParseError::new("packet length is less than 4 bytes"))
     }
@@ -655,22 +565,110 @@ fn to_packet(s: String) -> Result<Packet, UciPacketParseError> {
     Ok(Packet::new(bytes))
 }
 
+fn print_packet(pkt: Packet) -> Result<(), UciPacketParseError> {
+    macro_rules! define_packet {
+        ($gid: ident, $oid: ident, $mt: ident) => {
+            (PacketId::from((gid::$gid, oid::$oid, mt::$mt)), concat!(stringify!($oid), "_", stringify!($mt)))
+        }
+    }
+    let packet_list = HashMap::from([
+        define_packet!(CORE, CORE_DEVICE_RESET, CMD),
+        define_packet!(CORE, CORE_DEVICE_RESET, RSP),
+        define_packet!(CORE, CORE_DEVICE_STATUS, NTF),
+        define_packet!(CORE, CORE_GET_DEVICE_INFO, CMD),
+        define_packet!(CORE, CORE_GET_DEVICE_INFO, RSP),
+        define_packet!(CORE, CORE_SET_CONFIG, CMD),
+        define_packet!(CORE, CORE_SET_CONFIG, RSP),
+        define_packet!(SESSION, SESSION_INIT, CMD),
+        define_packet!(SESSION, SESSION_INIT, RSP),
+        define_packet!(SESSION, SESSION_STATUS, NTF),
+        define_packet!(SESSION, SESSION_SET_APP_CONFIG, CMD),
+        define_packet!(SESSION, SESSION_SET_APP_CONFIG, RSP),
+        define_packet!(RANGING, RANGE_START, CMD),
+        define_packet!(RANGING, RANGE_START, RSP),
+        define_packet!(PROPRIETARY, NXP_CORE_DEVICE_INIT, CMD),
+        define_packet!(PROPRIETARY, NXP_CORE_DEVICE_INIT, RSP),
+        define_packet!(PROPRIETARY, NXP_SET_CALIBRATION, CMD),
+        define_packet!(PROPRIETARY, NXP_SET_CALIBRATION, RSP),
+        define_packet!(PROPRIETARY, NXP_SE_COMM_ERROR, NTF),
+        define_packet!(PROPRIETARY, NXP_BINDING_STAT, NTF),
+    ]);
+
+    let printer = BasicPrinter;
+
+    let id = PacketId::from((pkt.gid(), pkt.oid(), pkt.mt()));
+    let ret = packet_list.get(&id);
+    if ret == None {
+        return Err(UciPacketParseError::new(&format!("unrecognized packet {}", pkt)));
+    }
+
+    let packet_name = ret.unwrap();
+
+    printer.print_id(packet_name);
+
+
+    macro_rules! id {
+        ($gid: ident, $oid: ident, $mt: ident) => {
+            PacketId (gid::$gid, oid::$oid, mt::$mt)
+        }
+    }
+
+    match id {
+        id!(CORE, CORE_DEVICE_RESET, RSP) |
+        id!(CORE, CORE_SET_CONFIG, RSP) |
+        id!(SESSION, SESSION_INIT, RSP) |
+        id!(SESSION, SESSION_SET_APP_CONFIG, RSP) |
+        id!(PROPRIETARY, NXP_CORE_DEVICE_INIT, RSP) |
+        id!(PROPRIETARY, NXP_SET_CALIBRATION, RSP) |
+        id!(RANGING, RANGE_START, RSP)
+            => print_status_only(&printer, &pkt),
+
+        id!(CORE, CORE_DEVICE_STATUS, NTF) =>
+            print_static(&printer, &pkt, &[Field("STATUS", ParamType::Map8(&*DEVICE_STATUS_CODES))]),
+        id!(SESSION, SESSION_INIT, CMD) =>
+            print_static(&printer, &pkt, &[Field("SESSION_ID", ParamType::Hex32), Field("SESSION_TYPE", ParamType::Hex8)]),
+        id!(CORE, CORE_SET_CONFIG, CMD) =>
+            print_config(&printer, &pkt, 0, &*DEVICE_CONF_PARAMS, Some(&*DEVICE_CONF_PARAMS_NXP)),
+        id!(SESSION, SESSION_SET_APP_CONFIG, CMD) => {
+            print_static(&printer, &pkt, &[Field("SESSION_ID", ParamType::Hex32)])?;
+            print_config(&printer, &pkt, 4, &*APP_CONF_PARAMS, None)?;
+            Ok(())
+        }
+        id!(SESSION, SESSION_STATUS, NTF) =>
+            print_static(&printer, &pkt, &[
+                         Field("SESSION_ID", ParamType::Hex32),
+                         Field("SESSION_STATE", ParamType::Map8(&*SESSION_STATE_CODES)),
+                         Field("REASON_CODE", ParamType::Hex8),
+            ]),
+        id!(PROPRIETARY, NXP_CORE_DEVICE_INIT, CMD) =>
+            print_static(&printer, &pkt, &[Field("MAJOR_VER", ParamType::Hex8), Field("MINOR_VER", ParamType::Hex8)]),
+        id!(PROPRIETARY, NXP_SET_CALIBRATION, CMD) =>
+            print_set_calibration(&printer, &pkt),
+        id!(PROPRIETARY, NXP_SE_COMM_ERROR, NTF) =>
+            print_static(&printer, &pkt, &[Field("STATUS", ParamType::Map8(&*STATUS_CODES)),
+                Field("CLA_INS", ParamType::Hex16),
+                Field("T=1_STATUS_CODE", ParamType::Hex16)]),
+        id!(PROPRIETARY, NXP_BINDING_STAT, NTF) =>
+            print_static(&printer, &pkt, &[
+                         Field("STATUS", ParamType::Table8(&[(0u8, "Not bound"), (1u8, "Bound,unlocked"), (2u8, "Bound,locked"), (3u8, "Unknown")])),
+                         Field("SE binding count", ParamType::Dec8),
+                         Field("UWBS binding count", ParamType::Dec8),
+            ]),
+        id!(RANGING, RANGE_START, CMD) =>
+            print_static(&printer, &pkt, &[Field("SESSION_ID", ParamType::Hex32)]),
+        _ => {
+            printer.print_param("Unrecognized(raw binary)", &print_hexarr(&pkt, 0, pkt.len().into()));
+            Ok(())
+        }
+    }
+}
+
 pub fn print(s: String) {
     match to_packet(s) {
         Ok(pkt) => {
-            let id = (pkt.gid(), pkt.oid(), pkt.mt());
-            let ret = PRINTERS.get(&id);
-            match ret {
-                Some(printer) => {
-                    let s = match (printer.handler)(id, printer, pkt) {
-                        Ok(s) => s,
-                        Err(e) => e.msg,
-                    };
-                    println!("{}", s);
-                }
-                None => {
-                    println!("{}", pkt);
-                }
+            match print_packet(pkt) {
+                Ok(_) => (),
+                Err(e) => println!("{}", e),
             };
         }
         Err(e) => {
