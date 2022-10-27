@@ -1,8 +1,8 @@
+use byteorder::{ByteOrder, LittleEndian};
+use lazy_static::lazy_static;
+use std::collections::HashMap;
 use std::fmt;
 use std::num::ParseIntError;
-use std::collections::HashMap;
-use lazy_static::lazy_static;
-use byteorder::{ByteOrder, LittleEndian};
 
 /* Packet type */
 struct Packet{
@@ -79,7 +79,6 @@ impl fmt::Display for UciPacketParseError {
 /*
  * UCI protocol definitions
  */
-#[allow(dead_code)]
 mod mt {
     pub const CMD   :u8 = 1;
     pub const RSP   :u8 = 2;
@@ -115,7 +114,7 @@ mod oid {
     pub const SESSION_GET_STATE         :u8 = 6;
 
     pub const RANGE_START               :u8 = 0;
-    pub const RANGE_DATA_NTF            :u8 = 0;
+    pub const RANGE_DATA                :u8 = 0;
     pub const RANGE_STOP                :u8 = 1;
     pub const GET_RANGING_COUNT         :u8 = 3;
     pub const BLINK_DATA_TX             :u8 = 4;
@@ -144,6 +143,44 @@ mod oid {
     pub const NXP_READ_CALIB_DATA       :u8 = 1;
 }
 
+mod range_data {
+    #[repr(u8)]
+    #[derive(Copy, Clone)]
+    pub enum MacType {
+        Short = 0,
+        Long,
+        Unknown,
+    }
+    impl From<u8> for MacType {
+        fn from(v: u8) -> Self {
+            match v {
+                2 => MacType::Short,
+                1 => MacType::Long,
+                _ => MacType::Unknown,
+            }
+        }
+    }
+
+    #[repr(u8)]
+    #[derive(Copy, Clone)]
+    pub enum ReportType {
+        Tdoa,
+        Twr,
+        DownTdoa,
+        Unknown,
+    }
+    impl From<u8> for ReportType {
+        fn from(v: u8) -> Self {
+            match v {
+                0 => ReportType::Tdoa,
+                1 => ReportType::Twr,
+                2 => ReportType::DownTdoa,
+                _ => ReportType::Unknown,
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(PartialEq)]
 enum ParamType {
@@ -153,6 +190,8 @@ enum ParamType {
     Dec8,
     Dec16,
     Dec32,
+    Q16(usize), /* e.g. Q16(7) == Q9.7 */
+    RFU(usize),
     HexArray(i16),
     CharArray(u16),
     Table8(&'static [(u8, &'static str)]),
@@ -168,10 +207,12 @@ impl Field {
             ParamType::Hex8  | ParamType::Dec8  => 1,
             ParamType::Hex16 | ParamType::Dec16 => 2,
             ParamType::Hex32 | ParamType::Dec32 => 4,
+            ParamType::Q16(_) => 2,
+            ParamType::RFU(n) => n,
             ParamType::HexArray(x) => x as usize,
             ParamType::CharArray(x) => x as usize,
-            ParamType::Table8(_x) => 1,
-            ParamType::Map8(_x) => 1,
+            ParamType::Table8(_) => 1,
+            ParamType::Map8(_) => 1,
         }
     }
     fn length_compatible(&self, len: usize) -> bool {
@@ -383,6 +424,7 @@ fn print_hexarr(pkt: &Packet, offset: usize, len: usize) -> String {
 
 trait Printer {
     fn print_id<'a>(&self, name: &'a str);
+    fn print_comment<'a>(&self, s: &'a str);
     fn print_param<'a>(&self, name: &'a str, val: &'a str);
 }
 
@@ -392,16 +434,15 @@ impl Printer for BasicPrinter {
     fn print_id<'a>(&self, name: &'a str) {
         println!("{}", name);
     }
+    fn print_comment<'a>(&self, s: &'a str) {
+        println!("{}", s);
+    }
     fn print_param<'a>(&self, name: &'a str, val: &'a str) {
         println!("- {} = {}", name, val);
     }
 }
 
-/*
- * Packet Printers
- */
-/* e.g. "DPD_WAKEUP_SRC = 0x0" */
-fn print_field(field: &Field, pkt: &Packet, offset: usize, len: usize)-> String {
+fn print_field(field: &Field, pkt: &Packet, offset: usize, len: usize)-> Option<String> {
 
     macro_rules! printf {
         ($pkt: ident, $fmt: expr, $offset: expr, $len: ident) => {
@@ -416,7 +457,11 @@ fn print_field(field: &Field, pkt: &Packet, offset: usize, len: usize)-> String 
         }
     }
 
-    if !field.length_compatible(len) {
+    if let ParamType::RFU(_) = field.1 {
+        return None;
+    }
+
+    let ret = if !field.length_compatible(len) {
         format!("length mismatch expected={}, actual={}", field.size(), len)
     } else {
         match field.1 {
@@ -450,26 +495,26 @@ fn print_field(field: &Field, pkt: &Packet, offset: usize, len: usize)-> String 
             }
             _ => print_hexarr(pkt, offset, len),
         }
-    }
+    };
+    Some(ret)
 }
 
-fn print_static<'a>(printer: &dyn Printer, pkt: &Packet, fields: &[Field])-> Result<(), UciPacketParseError> {
-    let mut offset = 0;
-
+fn _print_static<'a>(printer: &dyn Printer, pkt: &Packet, fields: &Vec<Field>, offset: &mut usize)-> Result<(), UciPacketParseError> {
     for field in fields {
         let len = field.size();
-        if (offset + len) > pkt.len().into() {
+        if (*offset + len) > pkt.len().into() {
             return Err(UciPacketParseError::new("length mismatch"));
         }
-        let v = print_field(field, &pkt, offset, len);
-        printer.print_param(field.0, &v);
-        offset = offset + len;
+        if let Some(v) = print_field(&field, &pkt, *offset, len) {
+            printer.print_param(field.0, &v);
+        }
+        *offset = *offset + len;
     }
     Ok(())
 }
 
-fn print_status_only(printer: &impl Printer, pkt: &Packet) -> Result<(), UciPacketParseError> {
-    print_static(printer, pkt, &[Field("STATUS", ParamType::Map8(&*STATUS_CODES))])
+fn print_static<'a>(printer: &dyn Printer, pkt: &Packet, fields: &Vec<Field>)-> Result<(), UciPacketParseError> {
+    _print_static(printer, &pkt, fields, &mut 0)
 }
 
 fn print_config(printer: &dyn Printer, pkt: &Packet, off: usize,
@@ -496,25 +541,41 @@ fn print_config(printer: &dyn Printer, pkt: &Packet, off: usize,
         let b1 = pkt.get(offset + 1);
         let len: usize;
 
-        let (name, val) = if b0 < 0xe0u8 || (offset + 3) > pkt.len().into() || ext_table == None {
+        if b0 < 0xe0u8 || (offset + 3) > pkt.len().into() || ext_table == None {
             /* standard TLV */
             len = b1.into();
             offset = offset + 2;
             match table.get(&b0) {
-                Some(field) => (format!("{}({:#04x})", field.0, b0), print_field(field, &pkt, offset, len)),
-                None => (format!("Unknown({:#04x})", b0), print_hexarr(&pkt, offset, len)),
+                Some(field) => {
+                    let name = format!("{}({:#04x})", field.0, b0);
+                    let val = match print_field(field, &pkt, offset, len) {
+                        Some(v) => v,
+                        None => "BUG".to_string(),
+                    };
+                    printer.print_param(name.as_str(), val.as_str());
+                }
+                None => {
+                    printer.print_param(&format!("Unknown({:#04x} {:#04x})", b0, b1), &print_hexarr(&pkt, offset, len));
+                }
             }
         } else {
             /* NXP extended TLV: id0 + id1 + len + value */
             len = pkt.get(offset + 2).into();
             offset = offset + 3;
             match ext_table.unwrap().get(&(b0, b1)) {
-                Some(field) => (format!("{}({:#04x}:{:#04x})", field.0, b0, b1), print_field(field, &pkt, offset, len)),
-                None => (format!("Unknown({:#04x} {:#04x})", b0, b1), print_hexarr(&pkt, offset, len)),
+                Some(field) => {
+                    let name = format!("{}({:#04x}:{:#04x})", field.0, b0, b1);
+                    let val = match print_field(field, &pkt, offset, len) {
+                        Some(v) => v,
+                        None => "BUG".to_string(),
+                    };
+                    printer.print_param(name.as_str(), val.as_str());
+                }
+                None => {
+                    printer.print_param(&format!("Unknown({:#04x} {:#04x})", b0, b1), &print_hexarr(&pkt, offset, len));
+                }
             }
         };
-
-        printer.print_param(name.as_str(), val.as_str());
 
         offset = offset + len;
         n = n + 1;
@@ -522,22 +583,25 @@ fn print_config(printer: &dyn Printer, pkt: &Packet, off: usize,
     Ok(())
 }
 
-fn print_set_calibration(printer: &dyn Printer, pkt: &Packet) -> Result<(), UciPacketParseError> {
-
-    if pkt.len() < 3 {
-        return Err(UciPacketParseError::new("payload len mismatch"));
-    }
-
-    printer.print_param("CHANNEL", &format!("{}", pkt.get(0)));
-    let id = pkt.get(1);
-    let (name, val) = match DEVCAL_PARAMS_NXP.get(&id) {
-        Some(field) => (format!("{}({:#04x})", field.0, id), print_field(field, &pkt, 2, (pkt.len() - 2).into())),
-        None => (format!("{:#4x}:Unknown", id), print_hexarr(&pkt, 2, (pkt.len() - 2).into())),
-    };
-    printer.print_param(&name, &val);
-    Ok(())
+fn print_range_data_twr(printer: &dyn Printer, pkt: &Packet, offset: &mut usize,
+                        mac_type: range_data::MacType) -> Result<(), UciPacketParseError> {
+    let arr = [
+        Field("Mac Address", match mac_type { range_data::MacType::Short => ParamType::Hex8, _ => ParamType::HexArray(8) }),
+        Field("Status", ParamType::Map8(&*STATUS_CODES)),
+        Field("NLoS", ParamType::Table8(&[(0u8, "LoS"), (1u8, "NLoS")])),
+        Field("Distance", ParamType::Dec16),
+        Field("AoA Azimuth", ParamType::Q16(7)),
+        Field("AoA Azimuth FOM", ParamType::Dec8),
+        Field("AoA Elevation", ParamType::Q16(7)),
+        Field("AoA Elevation FOM", ParamType::Dec8),
+        Field("AoA Destination Azimuth", ParamType::Q16(7)),
+        Field("AoA Destination Azimuth FOMR", ParamType::Dec8),
+        Field("AoA Destination Elevation", ParamType::Q16(7)),
+        Field("AoA Destination Elevation FOMR", ParamType::Dec8),
+        Field("Slot Index", ParamType::Dec8),
+    ];
+    _print_static(printer, &pkt, &Vec::from(arr), offset)
 }
-
 
 fn to_packet(s: String) -> Result<Packet, UciPacketParseError> {
     fn parse_hexstr(s: String) -> Result<Vec<u8>, ParseIntError> {
@@ -565,105 +629,182 @@ fn to_packet(s: String) -> Result<Packet, UciPacketParseError> {
     Ok(Packet::new(bytes))
 }
 
+struct PacketDesc {
+    name: &'static str,
+    print: fn(printer: &dyn Printer, pkt: &Packet) -> Result<(), UciPacketParseError>,
+}
+
+lazy_static! {
+    static ref PACKETS: HashMap<PacketId, PacketDesc> = {
+        macro_rules! define_printer {
+            ($gid: ident, $oid: ident, $mt: ident, $printer: expr) => {
+                (
+                    PacketId::from((gid::$gid, oid::$oid, mt::$mt)),
+                    PacketDesc {
+                        name: concat!(stringify!($oid), "_", stringify!($mt)),
+                        print: $printer,
+                    },
+                )
+            }
+        }
+
+        fn print_status_only(printer: &dyn Printer, pkt: &Packet) -> Result<(), UciPacketParseError> {
+            print_static(printer, pkt, &vec![Field("STATUS", ParamType::Map8(&*STATUS_CODES))])
+        }
+
+        HashMap::from([
+            define_printer!(CORE, CORE_DEVICE_RESET, RSP, print_status_only),
+            define_printer!(CORE, CORE_DEVICE_STATUS, NTF,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![Field("STATUS", ParamType::Map8(&*DEVICE_STATUS_CODES))])
+                }
+            ),
+            define_printer!(CORE, CORE_SET_CONFIG, CMD,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_config(printer, pkt, 0, &*DEVICE_CONF_PARAMS, Some(&*DEVICE_CONF_PARAMS_NXP))
+                }
+            ),
+            define_printer!(CORE, CORE_SET_CONFIG, RSP, print_status_only),
+
+            define_printer!(SESSION, SESSION_INIT, CMD,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![Field("SESSION_ID", ParamType::Hex32), Field("SESSION_TYPE", ParamType::Hex8)])
+                }
+            ),
+            define_printer!(SESSION, SESSION_INIT, RSP, print_status_only),
+            define_printer!(SESSION, SESSION_STATUS, NTF,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![
+                                 Field("SESSION_ID", ParamType::Hex32),
+                                 Field("SESSION_STATE", ParamType::Map8(&*SESSION_STATE_CODES)),
+                                 Field("REASON_CODE", ParamType::Hex8),])
+                    }
+            ),
+            define_printer!(SESSION, SESSION_SET_APP_CONFIG, CMD,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![Field("SESSION_ID", ParamType::Hex32)])?;
+                    print_config(printer, pkt, 4, &*APP_CONF_PARAMS, None)?;
+                    Ok(())
+                }
+            ),
+            define_printer!(SESSION, SESSION_SET_APP_CONFIG, RSP, print_status_only),
+
+            define_printer!(PROPRIETARY, NXP_CORE_DEVICE_INIT, CMD,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![Field("MAJOR_VER", ParamType::Hex8), Field("MINOR_VER", ParamType::Hex8)])
+                }
+            ),
+            define_printer!(PROPRIETARY, NXP_CORE_DEVICE_INIT, RSP, print_status_only),
+
+            define_printer!(PROPRIETARY, NXP_SET_CALIBRATION, CMD,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    if pkt.len() < 3 {
+                        return Err(UciPacketParseError::new("payload len mismatch"));
+                    }
+                    printer.print_param("Channel", &format!("{}", pkt.get(0)));
+                    let id = pkt.get(1);
+                    match DEVCAL_PARAMS_NXP.get(&id) {
+                        Some(field) => {
+                            let name = format!("{}({:#04x})", field.0, id);
+                            let val = match print_field(field, &pkt, 2, (pkt.len() - 2).into()) {
+                                Some(v) => v,
+                                None => "BUG".to_string(),
+                            };
+                            printer.print_param(name.as_str(), val.as_str());
+                        }
+                        None => {
+                            printer.print_param(&format!("{:#4x}:Unknown", id), &print_hexarr(&pkt, 2, (pkt.len() - 2).into()));
+                        }
+                    }
+                    Ok(())
+                }
+            ),
+            define_printer!(PROPRIETARY, NXP_SET_CALIBRATION, RSP, print_status_only),
+
+            define_printer!(PROPRIETARY, NXP_SE_COMM_ERROR, NTF,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![Field("STATUS", ParamType::Map8(&*STATUS_CODES)),
+                        Field("CLA_INS", ParamType::Hex16),
+                        Field("T=1_STATUS_CODE", ParamType::Hex16)])
+                }
+            ),
+            define_printer!(PROPRIETARY, NXP_BINDING_STAT, NTF,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![
+                                 Field("STATUS", ParamType::Table8(&[(0u8, "Not bound"), (1u8, "Bound,unlocked"), (2u8, "Bound,locked"), (3u8, "Unknown")])),
+                                 Field("SE binding count", ParamType::Dec8),
+                                 Field("UWBS binding count", ParamType::Dec8)])
+                }
+            ),
+
+            define_printer!(RANGING, RANGE_START, RSP, print_status_only),
+            define_printer!(RANGING, RANGE_START, CMD,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    print_static(printer, pkt, &vec![Field("SESSION_ID", ParamType::Hex32)])
+                }
+            ),
+            define_printer!(RANGING, RANGE_DATA, NTF,
+                |printer: &dyn Printer, pkt: &Packet| -> Result<(), UciPacketParseError> {
+                    let len = pkt.len();
+
+                    if len < 25 {
+                        return Err(UciPacketParseError::new(&format!("mismatch length")));
+                    }
+
+                    let nr: u8 = pkt.get(24);
+                    let mut offset: usize = 24;
+                    let mac_type: range_data::MacType = pkt.get(16).into();
+                    let report_type: range_data::ReportType = pkt.get(13).into();
+
+                    let arr = [
+                        Field("Sequence number", ParamType::Dec32),
+                        Field("Session ID", ParamType::Hex32),
+                        Field("", ParamType::RFU(1)),
+                        Field("Ranging interval", ParamType::Dec32),
+                        Field("Ranging type", ParamType::Table8(&[(0u8, "TDoA"), (1u8, "TWR"), (2u8, "Down TDoA")])),
+                        Field("", ParamType::RFU(1)),
+                        Field("Mac addressing mode", ParamType::Table8(&[(0u8, "short"), (1u8, "long")])),
+                        Field("", ParamType::RFU(8)),
+                        Field("Number of Ranging Measurements", ParamType::Dec8),
+                    ];
+                    if let Err(e) = print_static(printer, pkt, &Vec::from(arr)) {
+                        return Err(e);
+                    }
+
+                    println!("nr = {}", nr);
+                    for i in 0..nr {
+                        printer.print_comment(&format!("Report {}", i));
+                        match report_type {
+                            range_data::ReportType::Twr => {
+                                if let Err(e) = print_range_data_twr(printer, pkt, &mut offset, mac_type) {
+                                    return Err(e);
+                                }
+                            }
+                            _ => {
+                                return Err(UciPacketParseError::new(&format!("unsupported measurement type {}", report_type as u8)));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            ),
+            ])
+    };
+}
+
 fn print_packet(pkt: Packet) -> Result<(), UciPacketParseError> {
-    macro_rules! define_packet {
-        ($gid: ident, $oid: ident, $mt: ident) => {
-            (PacketId::from((gid::$gid, oid::$oid, mt::$mt)), concat!(stringify!($oid), "_", stringify!($mt)))
-        }
-    }
-    let packet_list = HashMap::from([
-        define_packet!(CORE, CORE_DEVICE_RESET, CMD),
-        define_packet!(CORE, CORE_DEVICE_RESET, RSP),
-        define_packet!(CORE, CORE_DEVICE_STATUS, NTF),
-        define_packet!(CORE, CORE_GET_DEVICE_INFO, CMD),
-        define_packet!(CORE, CORE_GET_DEVICE_INFO, RSP),
-        define_packet!(CORE, CORE_SET_CONFIG, CMD),
-        define_packet!(CORE, CORE_SET_CONFIG, RSP),
-        define_packet!(SESSION, SESSION_INIT, CMD),
-        define_packet!(SESSION, SESSION_INIT, RSP),
-        define_packet!(SESSION, SESSION_STATUS, NTF),
-        define_packet!(SESSION, SESSION_SET_APP_CONFIG, CMD),
-        define_packet!(SESSION, SESSION_SET_APP_CONFIG, RSP),
-        define_packet!(RANGING, RANGE_START, CMD),
-        define_packet!(RANGING, RANGE_START, RSP),
-        define_packet!(PROPRIETARY, NXP_CORE_DEVICE_INIT, CMD),
-        define_packet!(PROPRIETARY, NXP_CORE_DEVICE_INIT, RSP),
-        define_packet!(PROPRIETARY, NXP_SET_CALIBRATION, CMD),
-        define_packet!(PROPRIETARY, NXP_SET_CALIBRATION, RSP),
-        define_packet!(PROPRIETARY, NXP_SE_COMM_ERROR, NTF),
-        define_packet!(PROPRIETARY, NXP_BINDING_STAT, NTF),
-    ]);
-
-    let printer = BasicPrinter;
-
     let id = PacketId::from((pkt.gid(), pkt.oid(), pkt.mt()));
-    let ret = packet_list.get(&id);
-    if ret == None {
-        return Err(UciPacketParseError::new(&format!("unrecognized packet {}", pkt)));
-    }
-
-    let packet_name = ret.unwrap();
-
-    printer.print_id(packet_name);
-
-
-    macro_rules! id {
-        ($gid: ident, $oid: ident, $mt: ident) => {
-            PacketId (gid::$gid, oid::$oid, mt::$mt)
+    match PACKETS.get(&id) {
+        Some(desc) => {
+            let printer = BasicPrinter;
+            printer.print_id(desc.name);
+            (desc.print)(&printer, &pkt)
         }
-    }
-
-    match id {
-        id!(CORE, CORE_DEVICE_RESET, RSP) |
-        id!(CORE, CORE_SET_CONFIG, RSP) |
-        id!(SESSION, SESSION_INIT, RSP) |
-        id!(SESSION, SESSION_SET_APP_CONFIG, RSP) |
-        id!(PROPRIETARY, NXP_CORE_DEVICE_INIT, RSP) |
-        id!(PROPRIETARY, NXP_SET_CALIBRATION, RSP) |
-        id!(RANGING, RANGE_START, RSP)
-            => print_status_only(&printer, &pkt),
-
-        id!(CORE, CORE_DEVICE_STATUS, NTF) =>
-            print_static(&printer, &pkt, &[Field("STATUS", ParamType::Map8(&*DEVICE_STATUS_CODES))]),
-        id!(SESSION, SESSION_INIT, CMD) =>
-            print_static(&printer, &pkt, &[Field("SESSION_ID", ParamType::Hex32), Field("SESSION_TYPE", ParamType::Hex8)]),
-        id!(CORE, CORE_SET_CONFIG, CMD) =>
-            print_config(&printer, &pkt, 0, &*DEVICE_CONF_PARAMS, Some(&*DEVICE_CONF_PARAMS_NXP)),
-        id!(SESSION, SESSION_SET_APP_CONFIG, CMD) => {
-            print_static(&printer, &pkt, &[Field("SESSION_ID", ParamType::Hex32)])?;
-            print_config(&printer, &pkt, 4, &*APP_CONF_PARAMS, None)?;
-            Ok(())
-        }
-        id!(SESSION, SESSION_STATUS, NTF) =>
-            print_static(&printer, &pkt, &[
-                         Field("SESSION_ID", ParamType::Hex32),
-                         Field("SESSION_STATE", ParamType::Map8(&*SESSION_STATE_CODES)),
-                         Field("REASON_CODE", ParamType::Hex8),
-            ]),
-        id!(PROPRIETARY, NXP_CORE_DEVICE_INIT, CMD) =>
-            print_static(&printer, &pkt, &[Field("MAJOR_VER", ParamType::Hex8), Field("MINOR_VER", ParamType::Hex8)]),
-        id!(PROPRIETARY, NXP_SET_CALIBRATION, CMD) =>
-            print_set_calibration(&printer, &pkt),
-        id!(PROPRIETARY, NXP_SE_COMM_ERROR, NTF) =>
-            print_static(&printer, &pkt, &[Field("STATUS", ParamType::Map8(&*STATUS_CODES)),
-                Field("CLA_INS", ParamType::Hex16),
-                Field("T=1_STATUS_CODE", ParamType::Hex16)]),
-        id!(PROPRIETARY, NXP_BINDING_STAT, NTF) =>
-            print_static(&printer, &pkt, &[
-                         Field("STATUS", ParamType::Table8(&[(0u8, "Not bound"), (1u8, "Bound,unlocked"), (2u8, "Bound,locked"), (3u8, "Unknown")])),
-                         Field("SE binding count", ParamType::Dec8),
-                         Field("UWBS binding count", ParamType::Dec8),
-            ]),
-        id!(RANGING, RANGE_START, CMD) =>
-            print_static(&printer, &pkt, &[Field("SESSION_ID", ParamType::Hex32)]),
-        _ => {
-            printer.print_param("Unrecognized(raw binary)", &print_hexarr(&pkt, 0, pkt.len().into()));
-            Ok(())
-        }
+        None => Err(UciPacketParseError::new(&format!("unrecognized packet {} => payload: {}", pkt, &print_hexarr(&pkt, 0, pkt.len().into())))),
     }
 }
 
-pub fn print(s: String) {
+pub fn parse(s: String) {
     match to_packet(s) {
         Ok(pkt) => {
             match print_packet(pkt) {
